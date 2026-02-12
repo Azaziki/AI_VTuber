@@ -1,17 +1,57 @@
-# -*- coding: utf-8 -*-
+"""AI VTuber runtime with Ollama + Live2D(VTS) + TTS pipeline.
+
+该脚本负责以下核心流程：
+1) 从 Ollama 获取文本回复并提取情绪标签。
+2) 使用 Edge TTS 合成音频并播放。
+3) 分析音频驱动口型参数。
+4) 通过 VTube Studio API 驱动表情、眨眼、头眼和手部动作。
 """
-AI VTuber（精简稳定版）
-功能保留：
-- Ollama LLM 回复（支持 /api/generate /api/chat /v1/chat/completions）
-- 情绪标签提取并从 TTS 文本中剔除
-- VTS：口型参数注入（VoiceVolumePlusMouthOpen / VoiceFrequencyPlusMouthSmile）
-- VTS：表情 exp3（可选）
-- VTS：眨眼（UDP BLINK:0.xx + 自然眨眼；找不到 EyeOpen 就自动创建 AiEyeOpenL/R）
-- 待机头/眼“更真人”：眼球先动头后跟、注视停留+微眼跳、呼吸式微摆（说话时暂停）
-- 待机/说话手部运动（找不到就自动创建 AiHand*，需在 VTS 做一次映射）
-- TTS 播放到指定输出设备（sounddevice；失败降级 winsound 默认设备）
-- 运行中切换音频设备：device <索引|关键词>
-"""
+
+# ===== 可选：切换到其他 LLM 供应商（示例，默认注释）=====
+# 1) OpenAI：
+#    - 安装依赖：pip install openai
+#    - 设置环境变量：
+#      set OPENAI_API_KEY=你的key        (Windows CMD)
+#      $env:OPENAI_API_KEY="你的key"      (PowerShell)
+#    - 可参考如下函数替换 ollama_generate：
+#
+#      # from openai import OpenAI
+#      # def openai_generate(user_text: str) -> str:
+#      #     client = OpenAI()
+#      #     resp = client.chat.completions.create(
+#      #         model="gpt-4o-mini",
+#      #         messages=[
+#      #             {"role": "system", "content": "请在回复中带上[emo=happy/sad/angry/surprise/neutral]标签"},
+#      #             {"role": "user", "content": user_text},
+#      #         ],
+#      #         temperature=0.7,
+#      #     )
+#      #     return (resp.choices[0].message.content or "").strip()
+#
+# 2) xAI（兼容 OpenAI SDK 的接口）：
+#    - 安装依赖：pip install openai
+#    - 设置环境变量：
+#      set XAI_API_KEY=你的key           (Windows CMD)
+#      $env:XAI_API_KEY="你的key"         (PowerShell)
+#    - 可参考如下函数替换 ollama_generate：
+#
+#      # from openai import OpenAI
+#      # def xai_generate(user_text: str) -> str:
+#      #     client = OpenAI(api_key=os.getenv("XAI_API_KEY"), base_url="https://api.x.ai/v1")
+#      #     resp = client.chat.completions.create(
+#      #         model="grok-2-latest",
+#      #         messages=[
+#      #             {"role": "system", "content": "请在回复中带上[emo=happy/sad/angry/surprise/neutral]标签"},
+#      #             {"role": "user", "content": user_text},
+#      #         ],
+#      #         temperature=0.7,
+#      #     )
+#      #     return (resp.choices[0].message.content or "").strip()
+#
+# 3) 接入方式：
+#    - 保留 extract_emotions_and_clean() 不变。
+#    - 在 main() 中把 ai_raw = ollama_generate(user) 改为你上面的 *_generate(user)。
+# =====================================================
 
 import asyncio
 import json
@@ -32,14 +72,15 @@ import edge_tts
 import sounddevice as sd
 
 try:
-    from scipy.io import wavfile  # pip install scipy
+    from scipy.io import wavfile
 except Exception:
     wavfile = None
 
 if platform.system() == "Windows":
     import winsound
 
-# -------------------- 配置 --------------------
+
+## 基础连接配置
 VTS_WS_URL = "ws://127.0.0.1:8001"
 API_NAME, API_VERSION = "VTubeStudioPublicAPI", "1.0"
 PLUGIN_NAME, PLUGIN_AUTHOR = "AI_VTuber_Full", "User"
@@ -51,19 +92,23 @@ OLLAMA_MODEL = "vtuber:latest"
 VOICE = "zh-CN-XiaoxiaoNeural"
 TMP_MP3, TMP_WAV = "tts.mp3", "tts.wav"
 
-# 音频输出：None=系统默认；字符串=名称关键字；整数=设备索引
+
+## 音频输出配置：可用 None / 设备索引 / 设备关键字
 AUDIO_OUTPUT_DEVICE: Optional[object] = "Voicemeeter Input"
 
-# 嘴型注入参数（VTS Tracking 输入）
+
 P_MOUTH_OPEN = "VoiceVolumePlusMouthOpen"
 P_MOUTH_SMILE = "VoiceFrequencyPlusMouthSmile"
+MOUTH_INJECT_PRIMARY_MODE = "Set"
+ENABLE_MOUTH_OPEN_PARAM = True
+ENABLE_MOUTH_SMILE_PARAM = True
 
-# 眨眼参数候选（找不到就创建 custom）
+
 EYE_L_CANDIDATES = ["EyeOpenLeft","EyeOpenL","EyeLeftOpen","EyeOpen_L","EyeBlinkLeft","EyeBlinkL","EyeL","EyeOpen"]
 EYE_R_CANDIDATES = ["EyeOpenRight","EyeOpenR","EyeRightOpen","EyeOpen_R","EyeBlinkRight","EyeBlinkR","EyeR","EyeOpen"]
 CUSTOM_EYE_L, CUSTOM_EYE_R = "AiEyeOpenL", "AiEyeOpenR"
 
-# 头/眼待机参数（找不到就创建 custom）
+
 HEAD_CANDIDATES_X = ["FaceAngleX","HeadAngleX","AngleX","RotationX"]
 HEAD_CANDIDATES_Y = ["FaceAngleY","HeadAngleY","AngleY","RotationY"]
 HEAD_CANDIDATES_Z = ["FaceAngleZ","HeadAngleZ","AngleZ","RotationZ"]
@@ -72,40 +117,40 @@ GAZE_CANDIDATES_Y = ["EyeY","EyeBallY","GazeY","LookY"]
 CUSTOM_HEAD_X, CUSTOM_HEAD_Y, CUSTOM_HEAD_Z = "AiHeadX","AiHeadY","AiHeadZ"
 CUSTOM_GAZE_X, CUSTOM_GAZE_Y = "AiGazeX","AiGazeY"
 
-# 手部候选（找不到就创建 custom）
+
 HAND_CANDIDATES_LX = ["HandLX","LeftHandX","ArmLX","LeftArmX","LArmX","LHandX"]
 HAND_CANDIDATES_LY = ["HandLY","LeftHandY","ArmLY","LeftArmY","LArmY","LHandY"]
 HAND_CANDIDATES_RX = ["HandRX","RightHandX","ArmRX","RightArmX","RArmX","RHandX"]
 HAND_CANDIDATES_RY = ["HandRY","RightHandY","ArmRY","RightArmY","RArmY","RHandY"]
 HAND_CANDIDATES_WAVE = ["HandWave","Wave","Gesture","HandGesture"]
-CUSTOM_HAND_LX, CUSTOM_HAND_LY, CUSTOM_HAND_RX, CUSTOM_HAND_RY, CUSTOM_HAND_WAVE = \
+CUSTOM_HAND_LX, CUSTOM_HAND_LY, CUSTOM_HAND_RX, CUSTOM_HAND_RY, CUSTOM_HAND_WAVE =\
     "AiHandLX","AiHandLY","AiHandRX","AiHandRY","AiHandWave"
 
-# 眨眼/眼开合映射
+
 INVERT_EYE = False
 EYE_OPEN_MIN, EYE_OPEN_MAX = 0.05, 0.65
 BLINK_COOLDOWN_SEC = 0.35
 BLINK_OPEN_FRAMES = (0.25, 0.55, 0.80, 1.0)
 BLINK_QUEUE_FLUSH = True
 
-# UDP 眨眼
+
 ENABLE_UDP_BLINK = True
 UDP_HOST, UDP_PORT = "127.0.0.1", 49721
 ENABLE_NATURAL_BLINK = True
 AUTO_START_BLINK_SENDER = True
 BLINK_SENDER_PATH = "blink_sender.py"
 
-# 音频分析（嘴型）
+
 FRAME_MS = 25
 VOL_GAIN, SMILE_GAIN = 1.20, 1.00
 FREQ_MIN, FREQ_MAX = 80.0, 350.0
 
-# 嘴型稳态修正：防止小声/短句“不开口”
-MOUTH_MIN_OPEN = 0.12   # 最低开口（0~1），太大就显得一直张嘴
-RMS_FLOOR = 0.002       # 音量地板，避免静音段把嘴型压到 0
-PITCH_RMS_GATE = 0.006  # 低于该 RMS 不算音高（避免噪声）
 
-# 表情 exp3（可选）
+MOUTH_MIN_OPEN = 0.12
+RMS_FLOOR = 0.002
+PITCH_RMS_GATE = 0.006
+
+
 ENABLE_EXPRESSIONS = True
 EMO_EXP_FILES = {
     "happy": ["xinxin.exp3.json", "bq3.exp3.json"],
@@ -115,16 +160,20 @@ EMO_EXP_FILES = {
     "neutral": [],
 }
 USE_RANDOM_EXPRESSION = True
+AUTO_RESET_EXPRESSION_AFTER_REPLY = True
 
-# 待机真人感（头/眼）
+
 ENABLE_IDLE_MOTION = True
 MOTION_HZ = 20
 MOTION_INTERVAL_SEC = (3.0, 6.0)
 MOTION_EASE_SEC = (0.60, 1.40)
 HEAD_X_RANGE, HEAD_Y_RANGE, HEAD_Z_RANGE = (-7.0, 7.0), (-5.0, 5.0), (-4.0, 4.0)
 EYE_X_RANGE, EYE_Y_RANGE = (-0.45, 0.45), (-0.30, 0.30)
+SPEAK_MOTION_GAIN = 0.72
+SPEAK_MOTION_HZ = 26
+SPEAK_NOD_PROB = 0.33
 
-# 手部运动
+
 ENABLE_HAND_MOTION = True
 HAND_HZ = 10
 HAND_INTERVAL_SEC = (2.2, 4.8)
@@ -134,8 +183,9 @@ SPEAK_GESTURE_GAIN = 0.55
 WAVE_DURATION_SEC = 0.75
 WAVE_COOLDOWN_SEC = (2.0, 5.0)
 
-# -------------------- 小工具 --------------------
+
 def load_token() -> Optional[str]:
+    """Load cached VTS auth token from disk."""
     if not os.path.exists(TOKEN_FILE):
         return None
     try:
@@ -145,10 +195,12 @@ def load_token() -> Optional[str]:
         return None
 
 def save_token(token: str) -> None:
+    """Persist VTS auth token to disk."""
     with open(TOKEN_FILE, "w", encoding="utf-8") as f:
         json.dump({"token": token}, f, ensure_ascii=False, indent=2)
 
 def find_ffmpeg() -> Optional[str]:
+    """Find ffmpeg from PATH or local script directory."""
     p = shutil.which("ffmpeg")
     if p:
         return p
@@ -157,6 +209,7 @@ def find_ffmpeg() -> Optional[str]:
     return cand if os.path.exists(cand) else None
 
 def list_audio_devices() -> None:
+    """Print available audio output devices for runtime selection."""
     print("\n=== 可用音频输出设备 ===")
     for i, dev in enumerate(sd.query_devices()):
         if dev.get("max_output_channels", 0) > 0:
@@ -181,7 +234,25 @@ def _eye_map(norm_0_1: float) -> float:
     x = max(0.0, min(1.0, float(norm_0_1)))
     return EYE_OPEN_MIN + x * (EYE_OPEN_MAX - EYE_OPEN_MIN)
 
-# -------------------- VTS Client --------------------
+def resolve_output_device_id(device_pref: Optional[object]) -> Optional[int]:
+    """Resolve user-configured output device to a sounddevice index."""
+    devices = sd.query_devices()
+    if isinstance(device_pref, int):
+        return device_pref if 0 <= device_pref < len(devices) else None
+    if isinstance(device_pref, str) and device_pref.strip():
+        key = device_pref.lower()
+        for idx, dev in enumerate(devices):
+            if dev.get("max_output_channels", 0) > 0 and key in dev["name"].lower():
+                return idx
+    return None
+
+
+def is_vts_api_error(resp: dict) -> bool:
+    """Return True when VTS response indicates an API-level error."""
+    mt = str(resp.get("messageType", ""))
+    return mt.lower() == "apierror"
+
+
 class VTSClient:
     def __init__(self, ws):
         self.ws = ws
@@ -205,7 +276,7 @@ class VTSClient:
             if not token:
                 return False
             save_token(token)
-            print("✅ token saved. VTS 弹窗请点 Allow/允许")
+            print("token saved. VTS 弹窗请点 Allow/允许")
 
         resp = await self.rpc({
             "apiName": API_NAME, "apiVersion": API_VERSION,
@@ -280,8 +351,10 @@ async def connect_vts() -> VTSClient:
         raise RuntimeError("VTS authenticate failed（请确认 VTS 弹窗已 Allow，并启用插件权限）")
     return vts
 
-# -------------------- Ollama --------------------
+
 def ollama_generate(user_text: str) -> str:
+    """Call Ollama with fallback endpoints and return plain text response."""
+    # 优先使用 /api/generate，失败后自动回退到兼容接口。
     system_hint = (
         "请在回复中用一个情绪标签标注你的语气，格式如：[emo=happy]/[emo=sad]/[emo=angry]/[emo=surprise]/[emo=neutral]。"
         "标签可放开头或结尾，正文正常回答。"
@@ -290,7 +363,7 @@ def ollama_generate(user_text: str) -> str:
     def _post(url: str, payload: dict) -> requests.Response:
         return requests.post(url, json=payload, timeout=180)
 
-    # ① /api/generate
+
     try:
         r = _post(OLLAMA_URL, {"model": OLLAMA_MODEL, "prompt": system_hint + "\n用户：" + user_text + "\n回复：", "stream": False})
         if r.status_code == 404:
@@ -301,7 +374,7 @@ def ollama_generate(user_text: str) -> str:
         if getattr(e.response, "status_code", None) not in (404,):
             raise
 
-    # ② /api/chat
+
     try:
         url2 = OLLAMA_URL.replace("/api/generate", "/api/chat")
         r = _post(url2, {"model": OLLAMA_MODEL, "messages": [{"role":"system","content":system_hint},{"role":"user","content":user_text}], "stream": False})
@@ -315,13 +388,13 @@ def ollama_generate(user_text: str) -> str:
         if getattr(e.response, "status_code", None) not in (404,):
             raise
 
-    # ③ /v1/chat/completions
+
     url3 = OLLAMA_URL.replace("/api/generate", "/v1/chat/completions")
     r = _post(url3, {"model": OLLAMA_MODEL, "messages": [{"role":"system","content":system_hint},{"role":"user","content":user_text}], "temperature": 0.7})
     r.raise_for_status()
     return str(r.json()["choices"][0]["message"]["content"]).strip()
 
-# -------------------- 情绪标签解析 --------------------
+
 _EMO_ALIASES = {
     "happy": {"happy","joy","smile","开心","高兴","喜","愉快","兴奋"},
     "sad": {"sad","down","cry","难过","伤心","沮丧","失落"},
@@ -329,6 +402,7 @@ _EMO_ALIASES = {
     "surprise": {"surprise","wow","惊讶","震惊","意外"},
     "neutral": {"neutral","calm","平静","正常","中性"},
 }
+_EMO_ALIASES_LOWER = {emo: {v.lower() for v in vocab} for emo, vocab in _EMO_ALIASES.items()}
 _TAG_PATTERNS = [
     re.compile(r"\[(?:emo|emotion)\s*[:=]\s*([^\]\s]+)\s*\]", re.IGNORECASE),
     re.compile(r"\[([^\]\s]{2,16})\]"),
@@ -341,6 +415,7 @@ def extract_emotions_and_clean(text: str) -> Tuple[str, str, float]:
     - 如果模型没给标签，会用关键词/符号做一个保守兜底
     - intensity 过低时抬到一个可见值，避免“表情不变”
     """
+    # 先采集标签，再根据别名表映射到统一情绪。
     tags: Set[str] = set()
     for pat in _TAG_PATTERNS:
         for m in pat.finditer(text):
@@ -350,7 +425,7 @@ def extract_emotions_and_clean(text: str) -> Tuple[str, str, float]:
     for t in tags:
         tl = t.lower()
         for emo, vocab in _EMO_ALIASES.items():
-            if tl in {x.lower() for x in vocab} or t in vocab:
+            if tl in _EMO_ALIASES_LOWER[emo] or t in vocab:
                 hit[emo] += 1
 
     emo = max(hit.items(), key=lambda kv: kv[1])[0] if any(v > 0 for v in hit.values()) else "neutral"
@@ -385,7 +460,7 @@ async def set_emotion_expression(vts: VTSClient, emotion: str, intensity: float)
     if emotion not in EMO_EXP_FILES:
         emotion = "neutral"
 
-    # 先关所有
+
     for files in EMO_EXP_FILES.values():
         for f in files:
             await vts.set_expression(f, False, fade=0.20)
@@ -395,10 +470,10 @@ async def set_emotion_expression(vts: VTSClient, emotion: str, intensity: float)
 
     choices = EMO_EXP_FILES[emotion]
     pick = random.choice(choices) if (USE_RANDOM_EXPRESSION and len(choices) > 1) else choices[0]
-    print(f"🙂 emo={emotion} intensity={intensity:.2f} expr={pick}")
+    print(f"emotion={emotion} intensity={intensity:.2f} expr={pick}")
     await vts.set_expression(pick, True, fade=0.25)
 
-# -------------------- TTS / 播放 --------------------
+
 async def tts_to_mp3(text: str, mp3_path: str) -> None:
     await edge_tts.Communicate(text, VOICE).save(mp3_path)
 
@@ -416,6 +491,7 @@ async def mp3_to_wav(mp3_path: str, wav_path: str) -> None:
             raise RuntimeError("wav 不是 RIFF（异常）")
 
 async def play_wav(wav_path: str) -> None:
+    """Play synthesized WAV on Windows with fallback to default output."""
     if platform.system() != "Windows":
         return
 
@@ -427,24 +503,14 @@ async def play_wav(wav_path: str) -> None:
             if getattr(data, "ndim", 1) == 1:
                 data = data.reshape(-1, 1)
 
-            device_id = None
             devices = sd.query_devices()
-
-            if isinstance(AUDIO_OUTPUT_DEVICE, int):
-                if 0 <= AUDIO_OUTPUT_DEVICE < len(devices):
-                    device_id = AUDIO_OUTPUT_DEVICE
-            elif isinstance(AUDIO_OUTPUT_DEVICE, str) and AUDIO_OUTPUT_DEVICE.strip():
-                key = AUDIO_OUTPUT_DEVICE.lower()
-                for i, dev in enumerate(devices):
-                    if dev.get("max_output_channels", 0) > 0 and key in dev["name"].lower():
-                        device_id = i
-                        break
+            device_id = resolve_output_device_id(AUDIO_OUTPUT_DEVICE)
 
             print(f"▶️ 播放到音频设备: {devices[device_id]['name'] if device_id is not None else '系统默认'}")
             sd.play(data, samplerate=fs, device=device_id, blocking=True)
             sd.wait()
         except Exception as e:
-            print(f"❌ 播播放失败: {e}，降级 winsound 默认设备")
+            print(f"播放失败: {e}，降级 winsound 默认设备")
             try:
                 winsound.PlaySound(wav_path, winsound.SND_FILENAME)
             except Exception:
@@ -452,7 +518,7 @@ async def play_wav(wav_path: str) -> None:
 
     await asyncio.to_thread(_play)
 
-# -------------------- 音频分析 -> 嘴型 --------------------
+
 def _autocorr_pitch_hz(frame: np.ndarray, sr: int, fmin=80.0, fmax=350.0) -> float:
     x = frame.astype(np.float32)
     x -= np.mean(x)
@@ -525,7 +591,7 @@ def analyze_wav_to_controls(wav_path: str, frame_ms: int = 40) -> Tuple[List[Tup
             controls.append((mouth, smile))
         return controls, frame_ms / 1000
 
-# -------------------- 眨眼 UDP --------------------
+
 class _BlinkUDPProtocol(asyncio.DatagramProtocol):
     def __init__(self, q: "asyncio.Queue[float]"):
         self.q = q
@@ -563,7 +629,7 @@ async def start_blink_sender_new_console() -> None:
     else:
         await asyncio.create_subprocess_exec(sys.executable, sender, cwd=here)
 
-# -------------------- VTS 参数初始化 --------------------
+
 P_EYE_L_OPEN: Optional[str] = None
 P_EYE_R_OPEN: Optional[str] = None
 P_HEAD_X: Optional[str] = None
@@ -587,16 +653,54 @@ async def init_eye_params(vts: VTSClient) -> None:
     right = _pick_first(exist, EYE_R_CANDIDATES)
     if left and right:
         P_EYE_L_OPEN, P_EYE_R_OPEN = left, right
-        print(f"👁 Eye params: L={left} R={right}")
+        print(f"Eye params: L={left} R={right}")
         return
 
-    print("⚠️ 未找到现成 EyeOpen，创建 AiEyeOpenL/R（需在 VTS 映射一次）")
+    print("未找到现成 EyeOpen，创建 AiEyeOpenL/R（需在 VTS 映射一次）")
     await vts.create_custom_parameter(CUSTOM_EYE_L, default=EYE_OPEN_MAX, minv=0.0, maxv=1.0)
     await vts.create_custom_parameter(CUSTOM_EYE_R, default=EYE_OPEN_MAX, minv=0.0, maxv=1.0)
     P_EYE_L_OPEN, P_EYE_R_OPEN = CUSTOM_EYE_L, CUSTOM_EYE_R
     print("设置(齿轮)->Model->VTS Parameter Setup：")
     print(f"  INPUT {CUSTOM_EYE_L} -> OUTPUT 左眼参数(如 ParamEyeLOpen)")
     print(f"  INPUT {CUSTOM_EYE_R} -> OUTPUT 右眼参数(如 ParamEyeROpen)")
+
+
+async def init_mouth_params(vts: VTSClient) -> None:
+    global P_MOUTH_OPEN, P_MOUTH_SMILE, ENABLE_MOUTH_OPEN_PARAM, ENABLE_MOUTH_SMILE_PARAM
+    try:
+        exist = await vts.list_input_parameters()
+    except Exception:
+        exist = []
+
+    actual_name_map = {p.casefold(): p for p in exist}
+    P_MOUTH_OPEN = actual_name_map.get("voicevolumeplusmouthopen", "VoiceVolumePlusMouthOpen")
+    P_MOUTH_SMILE = actual_name_map.get("voicefrequencyplusmouthsmile", "VoiceFrequencyPlusMouthSmile")
+
+    if actual_name_map:
+        ENABLE_MOUTH_OPEN_PARAM = "voicevolumeplusmouthopen" in actual_name_map
+        ENABLE_MOUTH_SMILE_PARAM = "voicefrequencyplusmouthsmile" in actual_name_map
+    else:
+        ENABLE_MOUTH_OPEN_PARAM = True
+        ENABLE_MOUTH_SMILE_PARAM = True
+
+    print(
+        f"Mouth params: Open={P_MOUTH_OPEN} enabled={ENABLE_MOUTH_OPEN_PARAM} "
+        f"Smile={P_MOUTH_SMILE} enabled={ENABLE_MOUTH_SMILE_PARAM}"
+    )
+
+    if not actual_name_map:
+        print("警告：未获取到 VTS 输入参数列表，将按内置嘴型参数名直接注入。")
+        return
+
+    missing = []
+    if not ENABLE_MOUTH_OPEN_PARAM:
+        missing.append("VoiceVolumePlusMouthOpen")
+    if not ENABLE_MOUTH_SMILE_PARAM:
+        missing.append("VoiceFrequencyPlusMouthSmile")
+    if missing:
+        print("警告：未在 VTS 输入参数中找到内置嘴型参数：" + ", ".join(missing))
+        print("将只注入已存在的内置参数，避免整包注入失败导致口型不动。")
+        print("请确认 VTube Studio 已启用麦克风跟踪，且模型支持嘴型跟踪参数。")
 
 async def init_motion_params(vts: VTSClient) -> None:
     global P_HEAD_X, P_HEAD_Y, P_HEAD_Z, P_GAZE_X, P_GAZE_Y
@@ -614,7 +718,7 @@ async def init_motion_params(vts: VTSClient) -> None:
     if any([P_HEAD_X, P_HEAD_Y, P_HEAD_Z, P_GAZE_X, P_GAZE_Y]):
         return
 
-    print("⚠️ 未找到现成头/眼输入，创建 AiHead*/AiGaze*（需在 VTS 映射一次）")
+    print("未找到现成头/眼输入，创建 AiHead*/AiGaze*（需在 VTS 映射一次）")
     await vts.create_custom_parameter(CUSTOM_HEAD_X, default=0.0, minv=-10.0, maxv=10.0)
     await vts.create_custom_parameter(CUSTOM_HEAD_Y, default=0.0, minv=-10.0, maxv=10.0)
     await vts.create_custom_parameter(CUSTOM_HEAD_Z, default=0.0, minv=-10.0, maxv=10.0)
@@ -643,7 +747,7 @@ async def init_hand_params(vts: VTSClient) -> None:
     if any([P_HAND_LX, P_HAND_LY, P_HAND_RX, P_HAND_RY, P_HAND_WAVE]):
         return
 
-    print("⚠️ 未找到现成手部输入，创建 AiHand*（需在 VTS 映射一次）")
+    print("未找到现成手部输入，创建 AiHand*（需在 VTS 映射一次）")
     for name, mn, mx, dv in [
         (CUSTOM_HAND_LX, -1.0, 1.0, 0.0),
         (CUSTOM_HAND_LY, -1.0, 1.0, 0.0),
@@ -653,11 +757,13 @@ async def init_hand_params(vts: VTSClient) -> None:
     ]:
         await vts.create_custom_parameter(name, default=dv, minv=mn, maxv=mx)
 
-    P_HAND_LX, P_HAND_LY, P_HAND_RX, P_HAND_RY, P_HAND_WAVE = \
+    P_HAND_LX, P_HAND_LY, P_HAND_RX, P_HAND_RY, P_HAND_WAVE =\
         CUSTOM_HAND_LX, CUSTOM_HAND_LY, CUSTOM_HAND_RX, CUSTOM_HAND_RY, CUSTOM_HAND_WAVE
 
-# -------------------- 运行状态 --------------------
+
 class State:
+    """Thread-safe shared state for emotion and speaking status."""
+    # 状态对象被多个协程共享，因此读写都需要加锁。
     def __init__(self):
         self._lock = asyncio.Lock()
         self.emo = "neutral"
@@ -680,8 +786,9 @@ class State:
 blink_lock = asyncio.Lock()
 _last_blink_ts = 0.0
 
-# -------------------- 眨眼逻辑 --------------------
+
 async def do_blink(vts: VTSClient, strength: float) -> None:
+    """Perform one blink animation with cooldown control."""
     global _last_blink_ts
     if not P_EYE_L_OPEN or not P_EYE_R_OPEN:
         return
@@ -691,7 +798,7 @@ async def do_blink(vts: VTSClient, strength: float) -> None:
             return
         _last_blink_ts = now
 
-        close_norm = max(0.0, 1.0 - float(strength))  # 0闭 1开
+        close_norm = max(0.0, 1.0 - float(strength))
         val = _eye_map(close_norm)
         if INVERT_EYE:
             val = 1.0 - val
@@ -712,7 +819,7 @@ async def do_blink(vts: VTSClient, strength: float) -> None:
             await asyncio.sleep(0.04)
 
 async def blink_loop(vts: VTSClient, st: State, q: "asyncio.Queue[float]"):
-    # 启动先睁眼
+
     if P_EYE_L_OPEN and P_EYE_R_OPEN:
         v = _eye_map(1.0)
         if INVERT_EYE:
@@ -772,7 +879,7 @@ async def idle_eye_keeper(vts: VTSClient):
             pass
         await asyncio.sleep(0.35)
 
-# -------------------- 待机头/眼（真人） --------------------
+
 async def idle_motion_loop(vts: VTSClient, st: State):
     if not ENABLE_IDLE_MOTION:
         return
@@ -879,7 +986,7 @@ async def idle_motion_loop(vts: VTSClient, st: State):
             except:
                 pass
 
-# -------------------- 手部运动 --------------------
+
 async def idle_hand_loop(vts: VTSClient, st: State):
     if not ENABLE_HAND_MOTION:
         return
@@ -949,9 +1056,52 @@ async def idle_hand_loop(vts: VTSClient, st: State):
 
         await asyncio.sleep(max(0.25, interval))
 
-# -------------------- 嘴型驱动 --------------------
+
 async def drive_voice_params(vts: VTSClient, controls: List[Tuple[float, float]], dt: float, st: State):
+    global MOUTH_INJECT_PRIMARY_MODE
     await st.set(speaking=True)
+    has_warned_mouth_error = False
+    has_warned_mouth_exception = False
+
+    async def inject_mouth(mouth_value: float, smile_value: float) -> None:
+        nonlocal has_warned_mouth_error, has_warned_mouth_exception
+        global MOUTH_INJECT_PRIMARY_MODE
+        payload = {}
+        if ENABLE_MOUTH_OPEN_PARAM:
+            payload[P_MOUTH_OPEN] = mouth_value
+        if ENABLE_MOUTH_SMILE_PARAM:
+            payload[P_MOUTH_SMILE] = smile_value
+        if not payload:
+            return
+
+        primary = MOUTH_INJECT_PRIMARY_MODE
+        secondary = "Add" if primary == "Set" else "Set"
+
+        try:
+            resp = await vts.inject(payload, mode=primary)
+        except Exception as ex:
+            if not has_warned_mouth_exception:
+                has_warned_mouth_exception = True
+                print(f"mouth inject raised exception: {ex}")
+            return
+
+        if not is_vts_api_error(resp):
+            return
+
+        try:
+            resp2 = await vts.inject(payload, mode=secondary)
+        except Exception:
+            return
+
+        if not is_vts_api_error(resp2):
+            MOUTH_INJECT_PRIMARY_MODE = secondary
+            print(f"mouth inject mode switched to {secondary}")
+            return
+
+        if not has_warned_mouth_error:
+            has_warned_mouth_error = True
+            print("mouth inject failed in both Set/Add mode, check VTS parameter mapping")
+
     try:
         start = time.perf_counter()
         i, n = 0, len(controls)
@@ -963,30 +1113,27 @@ async def drive_voice_params(vts: VTSClient, controls: List[Tuple[float, float]]
                 if i >= n:
                     break
             mouth, smile = controls[i]
-            try:
-                await vts.inject({P_MOUTH_OPEN: mouth, P_MOUTH_SMILE: smile}, mode="Set")
-            except Exception:
-                pass
+            await inject_mouth(mouth, smile)
             sleep_for = (start + (i + 1) * dt) - time.perf_counter()
             if sleep_for > 0:
                 await asyncio.sleep(sleep_for)
             i += 1
-        try:
-            await vts.inject({P_MOUTH_OPEN: 0.0, P_MOUTH_SMILE: 0.0}, mode="Set")
-        except Exception:
-            pass
+        await inject_mouth(0.0, 0.0)
     finally:
         await st.set(speaking=False)
 
-# -------------------- 主流程 --------------------
+
 async def main():
+    """Run interactive VTuber loop and orchestrate all background tasks."""
+    # 主流程：初始化连接 -> 启动后台任务 -> 处理用户输入。
     list_audio_devices()
-    print("🔌 Connecting to VTube Studio...")
+    print("Connecting to VTube Studio...")
     vts = await connect_vts()
-    vts_motion = await connect_vts()  # 待机动作独立连接，避免抢嘴型注入
-    print("🎉 Connected & authed.")
+    vts_motion = await connect_vts()
+    print("Connected & authed.")
 
     await init_eye_params(vts)
+    await init_mouth_params(vts)
     await init_motion_params(vts_motion)
     await init_hand_params(vts_motion)
 
@@ -996,7 +1143,7 @@ async def main():
     udp_transport = None
     if ENABLE_UDP_BLINK:
         udp_transport = await start_udp_blink_listener(blink_q)
-        print(f"👁 UDP blink listener on {UDP_HOST}:{UDP_PORT} (期待 BLINK:0.xx)")
+        print(f"UDP blink listener on {UDP_HOST}:{UDP_PORT} (期待 BLINK:0.xx)")
         if AUTO_START_BLINK_SENDER:
             await start_blink_sender_new_console()
 
@@ -1010,7 +1157,7 @@ async def main():
     await asyncio.sleep(1.0)
     await do_blink(vts, 0.55)
 
-    print("\n🎤 Ready. 输入 quit 退出。\n")
+    print("\nReady. 输入 quit 退出。\n")
     try:
         while True:
             user = (await asyncio.to_thread(input, "你：")).strip()
@@ -1018,7 +1165,7 @@ async def main():
                 continue
 
             if user.lower() in ("quit", "exit", "q", "退出"):
-                print("👋 已退出")
+                print("已退出")
                 break
 
             if user.lower().startswith("device "):
@@ -1028,7 +1175,7 @@ async def main():
                     AUDIO_OUTPUT_DEVICE = int(new_dev)
                 except ValueError:
                     AUDIO_OUTPUT_DEVICE = new_dev
-                print(f"🎧 音频输出设备已切换为：{AUDIO_OUTPUT_DEVICE}")
+                print(f"音频输出设备已切换为：{AUDIO_OUTPUT_DEVICE}")
                 continue
 
             ai_raw = ollama_generate(user)
@@ -1049,6 +1196,10 @@ async def main():
                 play_wav(TMP_WAV),
                 drive_voice_params(vts, controls, dt, st),
             )
+
+            if AUTO_RESET_EXPRESSION_AFTER_REPLY:
+                await st.set(emo="neutral", intensity=0.0)
+                await set_emotion_expression(vts, "neutral", 0.0)
     finally:
         for t in tasks:
             t.cancel()
