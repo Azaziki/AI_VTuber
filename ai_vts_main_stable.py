@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-AI VTuber 主脚本（最终整合稳定版）
+AI VTuber 主脚本
 - 嘴型：VoiceVolumePlusMouthOpen + VoiceFrequencyPlusMouthSmile
 - 情绪：从 LLM 回复中提取关键词/标签（并在 TTS 前自动删除，避免读出来）
 - 表情：可选启用 exp3（按 EMO_EXP_FILES 映射）
@@ -124,7 +124,7 @@ AUTO_START_BLINK_SENDER = True
 BLINK_SENDER_PATH = "blink_sender.py"
 
 # ================== LLM / TTS ==================
-OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_URL = "http://localhost:11434/api/generate" # 如果你使用其他的LLM api，请换成对应的Base URL和端口，这里默认本地部署的Ollama
 OLLAMA_MODEL = "vtuber:latest"  # 如果你做了 Modelfile 自定义镜像，在这里改名
 OLLAMA_TIMEOUT_SEC = 180
 OLLAMA_RETRY = 2
@@ -175,7 +175,7 @@ DEBUG_EMO = False
 # 待机随机头部/眼球转动（说话时自动暂停，避免影响嘴型/眨眼）
 ENABLE_IDLE_MOTION = True
 DEBUG_MOTION = False
-MOTION_HZ = 20  # 注入频率（真人感建议 18~24；太高会挤占其它注入）
+MOTION_HZ = 20  # 注入频率（建议 18~24；太高会挤占其它注入）
 MOTION_INTERVAL_SEC = (3.0, 6.0)  # 注视停留更久，更像真人
 MOTION_EASE_SEC = (0.60, 1.40)     # 过渡更慢更自然
 # 头部角度范围（单位通常 -30~30；按你的模型调小/调大）
@@ -251,7 +251,7 @@ class VTSClient:
             if not token:
                 return False
             save_token(token)
-            print("✅ token saved. VTS 弹窗请点 Allow/允许")
+            print("token saved. VTS 弹窗请点 Allow/允许")
 
         auth_req = {
             "apiName": API_NAME, "apiVersion": API_VERSION,
@@ -409,7 +409,7 @@ def ollama_generate(user_text: str, memory: ChatMemory) -> str:
         return requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT_SEC)
 
     # ① /api/generate
-    url1 = OLLAMA_URL  # 你配置的通常是 http://127.0.0.1:11434/api/generate
+    url1 = OLLAMA_URL  # 通常是 http://127.0.0.1:11434/api/generate
     for i in range(OLLAMA_RETRY + 1):
         try:
             r = _post(url1, {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False})
@@ -812,7 +812,7 @@ async def init_eye_tracking_params(vts: VTSClient) -> None:
         return
 
     # 创建 custom tracking 参数（若已存在，VTS 可能返回错误但不影响后续使用）
-    print("⚠️ 没找到现成 EyeOpen tracking 参数，创建 custom tracking 参数 AiEyeOpenL/AiEyeOpenR ...")
+    print("未找到现成 EyeOpen tracking 参数，创建 custom tracking 参数 AiEyeOpenL/AiEyeOpenR ...")
     for name in (CUSTOM_EYE_L, CUSTOM_EYE_R):
         try:
             resp = await vts.create_custom_parameter(
@@ -864,7 +864,7 @@ async def init_hand_params(vts: VTSClient) -> None:
                   (P_HAND_LX, P_HAND_LY, P_HAND_RX, P_HAND_RY, P_HAND_WAVE))
         return
 
-    print("⚠️ 没找到现成手部 tracking 输入参数，创建 custom tracking 参数 AiHandL*/AiHandR*/AiHandWave ...")
+    print("未找到现成手部 tracking 输入参数，创建 custom tracking 参数 AiHandL*/AiHandR*/AiHandWave ...")
 
     async def _create(name: str, minv: float, maxv: float, defaultv: float) -> None:
         try:
@@ -884,7 +884,7 @@ async def init_hand_params(vts: VTSClient) -> None:
         CUSTOM_HAND_LX, CUSTOM_HAND_LY, CUSTOM_HAND_RX, CUSTOM_HAND_RY, CUSTOM_HAND_WAVE
     )
 
-    print(f"🤚 使用 custom hand tracking 参数：L=({P_HAND_LX},{P_HAND_LY}) R=({P_HAND_RX},{P_HAND_RY}) wave={P_HAND_WAVE}")
+    print(f"使用 custom hand tracking 参数：L=({P_HAND_LX},{P_HAND_LY}) R=({P_HAND_RX},{P_HAND_RY}) wave={P_HAND_WAVE}")
     print("需要你在 VTS 里做一次映射（只需一次）：")
     print("设置(齿轮) -> Model -> 选择你的模型 -> VTS Parameter Setup")
     print(f"  INPUT: {CUSTOM_HAND_LX} -> OUTPUT: 左手/左臂 X（例如 ParamArmLX/ParamHandLX 等）")
@@ -935,7 +935,7 @@ async def init_motion_params(vts: VTSClient) -> None:
         return
 
     # 2) 没有现成参数：创建自定义 tracking 参数（若已存在，VTS 会报错但可忽略）
-    print("⚠️ 没找到现成头/眼 tracking 输入参数，创建 custom tracking 参数 AiHeadX/Y/Z + AiGazeX/Y ...")
+    print("未找到现成头/眼 tracking 输入参数，创建 custom tracking 参数 AiHeadX/Y/Z + AiGazeX/Y ...")
 
     async def _create(name: str, minv: float, maxv: float, defaultv: float = 0.0) -> None:
         try:
@@ -958,7 +958,7 @@ async def init_motion_params(vts: VTSClient) -> None:
     P_HEAD_X, P_HEAD_Y, P_HEAD_Z = CUSTOM_HEAD_X, CUSTOM_HEAD_Y, CUSTOM_HEAD_Z
     P_GAZE_X, P_GAZE_Y = CUSTOM_GAZE_X, CUSTOM_GAZE_Y
 
-    print(f"🧠 使用 custom motion tracking 参数：head=({P_HEAD_X},{P_HEAD_Y},{P_HEAD_Z}) gaze=({P_GAZE_X},{P_GAZE_Y})")
+    print(f"使用 custom motion tracking 参数：head=({P_HEAD_X},{P_HEAD_Y},{P_HEAD_Z}) gaze=({P_GAZE_X},{P_GAZE_Y})")
     print("需要你在 VTS 里做一次映射（只需一次）：")
     print("设置(齿轮) -> Model -> 选择你的模型 -> VTS Parameter Setup")
     print(f"  INPUT: {CUSTOM_HEAD_X} -> OUTPUT: 头部左右（常见 ParamAngleX）")
@@ -1420,7 +1420,7 @@ async def main():
 
             # 退出
             if user.lower() in ["quit", "exit", "q", "退出"]:
-                print("👋 已退出")
+                print("已退出")
                 break
 
             # 运行时切换音频输出设备：device <索引|关键词>
