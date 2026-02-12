@@ -21,6 +21,7 @@ import time
 import wave
 import re
 from typing import Dict, List, Tuple, Optional, Set
+from collections import deque
 
 import numpy as np
 import requests
@@ -125,6 +126,17 @@ BLINK_SENDER_PATH = "blink_sender.py"
 # ================== LLM / TTS ==================
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "vtuber:latest"  # 如果你做了 Modelfile 自定义镜像，在这里改名
+OLLAMA_TIMEOUT_SEC = 180
+OLLAMA_RETRY = 2
+CHAT_MEMORY_TURNS = 6  # 保留最近 N 轮（user+assistant）上下文
+
+SYSTEM_HINT = (
+    "你是直播互动型 AI VTuber。请用自然口语、简洁有趣地回答，"
+    "避免过度书面化；控制在 1~4 句，尽量方便 TTS 朗读。"
+    "请在回复中带一个情绪标签，格式："
+    "[emo=happy] / [emo=sad] / [emo=angry] / [emo=surprise] / [emo=neutral]。"
+    "标签可放开头或结尾，正文正常回答即可。"
+)
 
 VOICE = "zh-CN-XiaoxiaoNeural"
 TMP_MP3 = "tts.mp3"
@@ -358,46 +370,67 @@ async def start_blink_sender_new_console() -> Optional[asyncio.subprocess.Proces
 # -------------------------------------------------
 # LLM：Ollama
 # -------------------------------------------------
-def ollama_generate(user_text: str) -> str:
+class ChatMemory:
+    def __init__(self, max_turns: int):
+        self.max_turns = max(1, int(max_turns))
+        self.turns: "deque[Dict[str, str]]" = deque(maxlen=self.max_turns * 2)
+
+    def for_chat(self, user_text: str) -> List[Dict[str, str]]:
+        msgs = [{"role": "system", "content": SYSTEM_HINT}]
+        msgs.extend(self.turns)
+        msgs.append({"role": "user", "content": user_text})
+        return msgs
+
+    def for_generate(self, user_text: str) -> str:
+        pieces = [SYSTEM_HINT, ""]
+        for msg in self.turns:
+            role = "用户" if msg.get("role") == "user" else "助手"
+            pieces.append(f"{role}：{msg.get('content', '').strip()}")
+        pieces.append(f"用户：{user_text}")
+        pieces.append("助手：")
+        return "\n".join(pieces)
+
+    def add_turn(self, user_text: str, assistant_text: str) -> None:
+        self.turns.append({"role": "user", "content": user_text})
+        self.turns.append({"role": "assistant", "content": assistant_text})
+
+
+def ollama_generate(user_text: str, memory: ChatMemory) -> str:
     """
     兼容多种 Ollama 接口：
     1) /api/generate（默认）
     2) /api/chat（新接口，messages）
     3) /v1/chat/completions（OpenAI 兼容接口）
     """
-    system_hint = (
-        "请在回复中用一个情绪标签标注你的语气，标签格式举例："
-        "[emo=happy] 或 [emo=sad] 或 [emo=angry] 或 [emo=surprise] 或 [emo=neutral]。"
-        "标签可放在开头或结尾，正文正常回答即可。"
-    )
-
-    prompt = system_hint + "\n用户：" + user_text + "\n回复："
+    prompt = memory.for_generate(user_text)
+    messages = memory.for_chat(user_text)
 
     def _post(url: str, payload: dict) -> requests.Response:
-        return requests.post(url, json=payload, timeout=180)
+        return requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT_SEC)
 
     # ① /api/generate
     url1 = OLLAMA_URL  # 你配置的通常是 http://127.0.0.1:11434/api/generate
-    try:
-        r = _post(url1, {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False})
-        if r.status_code == 404:
-            raise requests.HTTPError("404", response=r)
-        r.raise_for_status()
-        return (r.json().get("response") or "").strip()
-    except requests.HTTPError as e:
-        # 如果不是 404，直接抛出（比如 500/401）
-        if getattr(e.response, "status_code", None) not in (404,):
-            raise
+    for i in range(OLLAMA_RETRY + 1):
+        try:
+            r = _post(url1, {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False})
+            if r.status_code == 404:
+                raise requests.HTTPError("404", response=r)
+            r.raise_for_status()
+            return (r.json().get("response") or "").strip()
+        except requests.HTTPError as e:
+            if getattr(e.response, "status_code", None) not in (404,) or i >= OLLAMA_RETRY:
+                raise
+        except requests.RequestException:
+            if i >= OLLAMA_RETRY:
+                raise
+            time.sleep(0.6)
 
     # ② /api/chat
     try:
         url2 = url1.replace("/api/generate", "/api/chat")
         r = _post(url2, {
             "model": OLLAMA_MODEL,
-            "messages": [
-                {"role": "system", "content": system_hint},
-                {"role": "user", "content": user_text},
-            ],
+            "messages": messages,
             "stream": False,
         })
         if r.status_code == 404:
@@ -416,16 +449,17 @@ def ollama_generate(user_text: str) -> str:
     url3 = url1.replace("/api/generate", "/v1/chat/completions")
     r = _post(url3, {
         "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": system_hint},
-            {"role": "user", "content": user_text},
-        ],
+        "messages": messages,
         "temperature": 0.7,
     })
     r.raise_for_status()
     j = r.json()
     # OpenAI style: choices[0].message.content
     return str(j["choices"][0]["message"]["content"]).strip()
+
+
+async def ollama_generate_async(user_text: str, memory: ChatMemory) -> str:
+    return await asyncio.to_thread(ollama_generate, user_text, memory)
 
 # -------------------------------------------------
 # 情绪关键词提取 + 清理（TTS 忽略）
@@ -1356,6 +1390,7 @@ async def main():
     await init_hand_params(vts_motion)
 
     st = State()
+    memory = ChatMemory(CHAT_MEMORY_TURNS)
     blink_q: "asyncio.Queue[float]" = asyncio.Queue(maxsize=64)
 
     udp_transport = None
@@ -1398,8 +1433,14 @@ async def main():
                     AUDIO_OUTPUT_DEVICE = new_dev       # 字符串 -> 名称关键词
                 print(f"🎧 音频输出设备已切换为：{AUDIO_OUTPUT_DEVICE}")
                 continue
-            ai_raw = ollama_generate(user)
+            try:
+                ai_raw = await ollama_generate_async(user, memory)
+            except Exception as e:
+                print(f"❌ LLM 生成失败：{e}")
+                continue
+
             print("她：", ai_raw)
+            memory.add_turn(user, ai_raw)
 
             # 2) 提取关键词/标签 + 清理给 TTS 的文本
             tts_text, emo, inten, _tags = extract_emotions_and_clean(ai_raw)
