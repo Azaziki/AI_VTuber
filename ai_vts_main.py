@@ -93,6 +93,22 @@ VOICE = "zh-CN-XiaoxiaoNeural"
 TMP_MP3, TMP_WAV = "tts.mp3", "tts.wav"
 
 
+## TTS 后端配置：edge / gpt_sovits
+TTS_BACKEND = "edge"
+
+## 本地 GPT-SoVITS 配置（当 TTS_BACKEND = "gpt_sovits" 时生效）
+GPT_SOVITS_URL = "http://127.0.0.1:9880/tts"
+GPT_SOVITS_REF_AUDIO = ""
+GPT_SOVITS_PROMPT_TEXT = ""
+GPT_SOVITS_PROMPT_LANG = "zh"
+GPT_SOVITS_TEXT_LANG = "zh"
+GPT_SOVITS_TOP_K = 5
+GPT_SOVITS_TOP_P = 1.0
+GPT_SOVITS_TEMPERATURE = 1.0
+GPT_SOVITS_SPEED = 1.0
+GPT_SOVITS_MEDIA_TYPE = "wav"
+
+
 ## 音频输出配置：可用 None / 设备索引 / 设备关键字
 AUDIO_OUTPUT_DEVICE: Optional[object] = "Voicemeeter Input"
 
@@ -476,6 +492,57 @@ async def set_emotion_expression(vts: VTSClient, emotion: str, intensity: float)
 
 async def tts_to_mp3(text: str, mp3_path: str) -> None:
     await edge_tts.Communicate(text, VOICE).save(mp3_path)
+
+
+def gpt_sovits_tts_request(text: str) -> tuple[bytes, str]:
+    """Request local GPT-SoVITS service and return (audio_bytes, content_type)."""
+    payload = {
+        "text": text,
+        "text_lang": GPT_SOVITS_TEXT_LANG,
+        "ref_audio_path": GPT_SOVITS_REF_AUDIO,
+        "prompt_text": GPT_SOVITS_PROMPT_TEXT,
+        "prompt_lang": GPT_SOVITS_PROMPT_LANG,
+        "top_k": GPT_SOVITS_TOP_K,
+        "top_p": GPT_SOVITS_TOP_P,
+        "temperature": GPT_SOVITS_TEMPERATURE,
+        "speed_factor": GPT_SOVITS_SPEED,
+        "media_type": GPT_SOVITS_MEDIA_TYPE,
+        "streaming_mode": False,
+    }
+    r = requests.post(GPT_SOVITS_URL, json=payload, timeout=300)
+    r.raise_for_status()
+    return r.content, str(r.headers.get("Content-Type", "")).lower()
+
+
+async def tts_to_wav(text: str, mp3_path: str, wav_path: str) -> None:
+    """Synthesize text to wav via selected TTS backend."""
+    backend = str(TTS_BACKEND).strip().lower()
+    if backend == "edge":
+        await tts_to_mp3(text, mp3_path)
+        await mp3_to_wav(mp3_path, wav_path)
+        return
+
+    if backend == "gpt_sovits":
+        audio_bytes, content_type = await asyncio.to_thread(gpt_sovits_tts_request, text)
+        if not audio_bytes:
+            raise RuntimeError("GPT-SoVITS 返回空音频")
+
+        is_mp3 = GPT_SOVITS_MEDIA_TYPE.lower() == "mp3" or "mpeg" in content_type or "mp3" in content_type
+        if is_mp3:
+            with open(mp3_path, "wb") as f:
+                f.write(audio_bytes)
+            await mp3_to_wav(mp3_path, wav_path)
+            return
+
+        with open(wav_path, "wb") as f:
+            f.write(audio_bytes)
+        with open(wav_path, "rb") as f:
+            if not f.read(12).startswith(b"RIFF"):
+                raise RuntimeError("GPT-SoVITS 返回的不是 WAV/RIFF，请检查 media_type")
+        return
+
+    raise RuntimeError(f"不支持的 TTS_BACKEND: {TTS_BACKEND}")
+
 
 async def mp3_to_wav(mp3_path: str, wav_path: str) -> None:
     ffmpeg = find_ffmpeg()
@@ -1188,8 +1255,7 @@ async def main():
             if not tts_text.strip():
                 tts_text = "嗯。"
 
-            await tts_to_mp3(tts_text, TMP_MP3)
-            await mp3_to_wav(TMP_MP3, TMP_WAV)
+            await tts_to_wav(tts_text, TMP_MP3, TMP_WAV)
 
             controls, dt = analyze_wav_to_controls(TMP_WAV, frame_ms=FRAME_MS)
             await asyncio.gather(
